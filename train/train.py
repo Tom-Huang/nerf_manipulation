@@ -122,8 +122,8 @@ class PixelNeRFTrainer(trainlib.Trainer):
         SB, NV, _, H, W = all_images.shape
         all_poses = data["poses"].to(device=device)  # (SB, NV, 4, 4)
         all_bboxes = data.get("bbox")  # (SB, NV, 4)  cmin rmin cmax rmax
-        all_focals = data["focal"]  # (SB)
-        all_c = data.get("c")  # (SB)
+        all_focals = data["focal"]  # (SB, NV, 2)
+        all_c = data.get("c")  # (SB, NV, 2)
 
         if self.use_bbox and global_step >= args.no_bbox_step:
             self.use_bbox = False
@@ -145,10 +145,10 @@ class PixelNeRFTrainer(trainlib.Trainer):
                 bboxes = all_bboxes[obj_idx]
             images = all_images[obj_idx]  # (NV, 3, H, W)
             poses = all_poses[obj_idx]  # (NV, 4, 4)
-            focal = all_focals[obj_idx]
+            focal = all_focals[obj_idx] # (NV, 2) or (2)
             c = None
             if "c" in data:
-                c = data["c"][obj_idx]
+                c = data["c"][obj_idx] # (NV, 2) or (2)
             if curr_nviews > 1:
                 # Somewhat inefficient, don't know better way
                 image_ord[obj_idx] = torch.from_numpy(
@@ -162,13 +162,21 @@ class PixelNeRFTrainer(trainlib.Trainer):
             rgb_gt_all = images_0to1
             rgb_gt_all = (
                 rgb_gt_all.permute(0, 2, 3, 1).contiguous().reshape(-1, 3)
-            )  # (NV, H, W, 3)
+            )  # (NV, H, W, 3) -> (NV * H * W, 3)
 
             if all_bboxes is not None:
                 pix = util.bbox_sample(bboxes, args.ray_batch_size)
                 pix_inds = pix[..., 0] * H * W + pix[..., 1] * W + pix[..., 2]
             else:
                 pix_inds = torch.randint(0, NV * H * W, (args.ray_batch_size,))
+
+                # batch_size_per_img = int(args.ray_batch_size / NV)
+                # pix_inds = []
+                # for nv_i in range(NV):
+                #     tmp_pix_inds = torch.randint(nv_i * H * W, (nv_i + 1) * H * W, (batch_size_per_img,))
+                #     pix_inds.append(tmp_pix_inds.clone())
+                # pix_inds = torch.cat(pix_inds, dim=0)
+                # assert pix_inds.shape[0] == args.ray_batch_size
 
             rgb_gt = rgb_gt_all[pix_inds]  # (ray_batch_size, 3)
             rays = cam_rays.view(-1, cam_rays.shape[-1])[pix_inds].to(
@@ -241,6 +249,11 @@ class PixelNeRFTrainer(trainlib.Trainer):
         if c is not None:
             c = c[batch_idx : batch_idx + 1]  # (1)
         NV, _, H, W = images.shape
+        if len(focal.shape) > 2:
+            focal = focal.squeeze(0)
+        if c is not None and len(c.shape) > 2:
+            c = c.squeeze(0)
+        
         cam_rays = util.gen_rays(
             poses, W, H, focal, self.z_near, self.z_far, c=c
         )  # (NV, H, W, 8)

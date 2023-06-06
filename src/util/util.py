@@ -1,4 +1,6 @@
 import cv2
+
+# import pybullet as p
 import numpy as np
 import torch
 from torchvision import transforms
@@ -8,6 +10,14 @@ import torch.nn.functional as F
 import functools
 import math
 import warnings
+import importlib
+
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+from typing import Union
 
 
 def image_float_to_uint8(img):
@@ -70,7 +80,10 @@ def get_image_to_tensor_balanced(image_size=0):
     if image_size > 0:
         ops.append(transforms.Resize(image_size))
     ops.extend(
-        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),]
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
     )
     return transforms.Compose(ops)
 
@@ -79,6 +92,46 @@ def get_mask_to_tensor():
     return transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.0,), (1.0,))]
     )
+
+
+# def pose_from_config(config):
+#     """Converts a config dict to a pose matrix."""
+#     rotation = p.getMatrixFromQuaternion(config['rotation'])
+#     rotm = np.float32(rotation).reshape(3, 3)
+#     position = np.float32(config['position'])
+#     pose = np.eye(4, dtype=np.float32)
+#     pose[:3, :3] = rotm #*np.array([1., -1., -1.]) to convert to openGL
+#     pose[:3, 3] = position
+#     return pose
+
+
+# TODO(Karim) make generic no matter what is the type of the space
+def action_dict_to_tensor(action):
+    # convert action to tensor
+    act_dict = {}
+    for k, v in action.items():
+        # check if v is tuple then loop and convert to torch tensor
+        if isinstance(v, tuple):
+            for i in range(len(v)):
+                act_dict[f"{k}_{i}"] = torch.tensor(v[i]).to(torch.float32)
+        else:
+            act_dict[k] = torch.tensor(v)  # .to(torch.float32)
+
+    return act_dict
+
+
+def dict_to_tensor(action):
+    # convert action to tensor
+    dict = {}
+    for k, v in action.items():
+        # check if v is tuple then loop and convert to torch tensor
+        if isinstance(v, tuple):
+            for i in range(len(v)):
+                dict[f"{k}_{i}"] = torch.tensor(v[i].copy()).to(torch.float32)
+        else:
+            dict[k] = torch.tensor(v.copy()).to(torch.float32)
+
+    return dict
 
 
 def homogeneous(points):
@@ -102,7 +155,7 @@ def gen_grid(*args, ij_indexing=False):
         np.vstack(
             np.meshgrid(
                 *(np.linspace(lo, hi, sz, dtype=np.float32) for lo, hi, sz in args),
-                indexing="ij" if ij_indexing else "xy"
+                indexing="ij" if ij_indexing else "xy",
             )
         )
         .reshape(len(args), -1)
@@ -131,12 +184,30 @@ def unproj_map(width, height, f, c=None, device="cpu"):
         f = f[None].expand(2)
     elif len(f.shape) == 1:
         f = f.expand(2)
-    Y, X = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32) - float(c[1]),
-        torch.arange(width, dtype=torch.float32) - float(c[0]),
-    )
-    X = X.to(device=device) / float(f[0])
-    Y = Y.to(device=device) / float(f[1])
+
+    if len(f.shape) == 1:
+        Y, X = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32) - float(c[1]),
+            torch.arange(width, dtype=torch.float32) - float(c[0]),
+        )
+        X = X.to(device=device) / float(f[0])
+        Y = Y.to(device=device) / float(f[1])
+
+    elif len(f.shape) == 2:
+        X, Y = [], []
+        for view in range(f.shape[0]):
+            Y_v, X_v = torch.meshgrid(
+                torch.arange(height, dtype=torch.float32).to(device) - c[view, 1],
+                torch.arange(width, dtype=torch.float32).to(device) - c[view, 0],
+            )
+
+            X_v = X_v.to(device=device) / f[view, 0]
+            Y_v = Y_v.to(device=device) / f[view, 1]
+            X.append(X_v)
+            Y.append(Y_v)
+        X = torch.stack(X, dim=0)
+        Y = torch.stack(Y, dim=0)
+
     Z = torch.ones_like(X)
     unproj = torch.stack((X, -Y, -Z), dim=-1)
     unproj /= torch.norm(unproj, dim=-1).unsqueeze(-1)
@@ -221,36 +292,68 @@ def bbox_sample(bboxes, num_pix):
     """
     :return (num_pix, 3)
     """
-    image_ids = torch.randint(0, bboxes.shape[0], (num_pix,))
-    pix_bboxes = bboxes[image_ids]
+    image_ids = torch.randint(0, bboxes.shape[0], (num_pix,)).to(bboxes.device)
+    pix_bboxes = bboxes[image_ids].long()
     x = (
-        torch.rand(num_pix) * (pix_bboxes[:, 2] + 1 - pix_bboxes[:, 0])
+        torch.rand(num_pix).to(bboxes.device)
+        * (pix_bboxes[:, 2] + 0.9 - pix_bboxes[:, 0])
         + pix_bboxes[:, 0]
     ).long()
     y = (
-        torch.rand(num_pix) * (pix_bboxes[:, 3] + 1 - pix_bboxes[:, 1])
+        torch.rand(num_pix).to(bboxes.device)
+        * (pix_bboxes[:, 3] + 0.9 - pix_bboxes[:, 1])
         + pix_bboxes[:, 1]
     ).long()
+
     pix = torch.stack((image_ids, y, x), dim=-1)
     return pix
 
 
-def gen_rays(poses, width, height, focal, z_near, z_far, c=None, ndc=False):
+def gen_rays(
+    poses, width, height, focal, z_near, z_far, c=None, ndc=False, bound_floor=False
+):
     """
+    poses (NV, 4, 4)
+    focal (NV, 2) or (2)
+    c (NV, 2) or (2)
     Generate camera rays
-    :return (B, H, W, 8)
+    :return (NV, H, W, 8)
     """
     num_images = poses.shape[0]
     device = poses.device
-    cam_unproj_map = (
-        unproj_map(width, height, focal.squeeze(), c=c, device=device)
-        .unsqueeze(0)
-        .repeat(num_images, 1, 1, 1)
-    )
-    cam_centers = poses[:, None, None, :3, 3].expand(-1, height, width, -1)
-    cam_raydir = torch.matmul(
-        poses[:, None, None, :3, :3], cam_unproj_map.unsqueeze(-1)
-    )[:, :, :, :, 0]
+
+    if len(focal.shape) < 2:
+        cam_unproj_map = (
+            unproj_map(width, height, focal.squeeze(), c=c, device=device)
+            .unsqueeze(0)
+            .repeat(num_images, 1, 1, 1)
+        )  # (NV, H, W, 3)
+        cam_raydir = torch.matmul(
+            poses[:, None, None, :3, :3], cam_unproj_map.unsqueeze(-1)
+        )[:, :, :, :, 0]
+    else:
+        cam_unproj_maps = [
+            unproj_map(width, height, fi, c=ci, device=device).unsqueeze(0)
+            for fi, ci in zip(focal, c)
+        ]
+        # corresponds to different cams for each image
+        # cam_unproj_map = (
+        #     unproj_map(width, height, focal.squeeze(), c=c, device=device)
+        # ) # (NV, H, W, 3)
+        cam_raydir = torch.cat(
+            [
+                torch.matmul(
+                    poses[i, None, None, :3, :3], cam_unproj_map.unsqueeze(-1)
+                )[:, :, :, :, 0]
+                for i, cam_unproj_map in enumerate(cam_unproj_maps)
+            ],
+            dim=0,
+        )  # (NV, H, W, 3)
+
+    cam_centers = poses[:, None, None, :3, 3].expand(
+        -1, height, width, -1
+    )  # (NV, 1, 1, 3)
+
     if ndc:
         if not (z_near == 0 and z_far == 1):
             warnings.warn(
@@ -264,21 +367,30 @@ def gen_rays(poses, width, height, focal, z_near, z_far, c=None, ndc=False):
     cam_nears = (
         torch.tensor(z_near, device=device)
         .view(1, 1, 1, 1)
-        .expand(num_images, height, width, -1)
+        .expand(num_images, height, width, -1)  # (NV, H, W, 1)
     )
     cam_fars = (
         torch.tensor(z_far, device=device)
         .view(1, 1, 1, 1)
-        .expand(num_images, height, width, -1)
+        .expand(num_images, height, width, -1)  # (NV, H, W, 1)
     )
+    if bound_floor:
+        z_far_test = (-1 * cam_centers[..., -1] / cam_raydir[..., -1])[..., None]
+        cam_fars = torch.where(z_far_test < cam_fars, z_far_test, cam_fars)
     return torch.cat(
         (cam_centers, cam_raydir, cam_nears, cam_fars), dim=-1
-    )  # (B, H, W, 8)
+    )  # (NV, H, W, 8)
 
 
 def trans_t(t):
     return torch.tensor(
-        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, t], [0, 0, 0, 1],], dtype=torch.float32,
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, t],
+            [0, 0, 0, 1],
+        ],
+        dtype=torch.float32,
     )
 
 
@@ -323,8 +435,8 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# def count_parameters(model):
+#     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def get_norm_layer(norm_type="instance", group_norm_groups=32):
@@ -492,15 +604,15 @@ def quat_to_rot(q):
     qi = q[:, 1]
     qj = q[:, 2]
     qk = q[:, 3]
-    R[:, 0, 0] = 1 - 2 * (qj ** 2 + qk ** 2)
+    R[:, 0, 0] = 1 - 2 * (qj**2 + qk**2)
     R[:, 0, 1] = 2 * (qj * qi - qk * qr)
     R[:, 0, 2] = 2 * (qi * qk + qr * qj)
     R[:, 1, 0] = 2 * (qj * qi + qk * qr)
-    R[:, 1, 1] = 1 - 2 * (qi ** 2 + qk ** 2)
+    R[:, 1, 1] = 1 - 2 * (qi**2 + qk**2)
     R[:, 1, 2] = 2 * (qj * qk - qi * qr)
     R[:, 2, 0] = 2 * (qk * qi - qj * qr)
     R[:, 2, 1] = 2 * (qj * qk + qi * qr)
-    R[:, 2, 2] = 1 - 2 * (qi ** 2 + qj ** 2)
+    R[:, 2, 2] = 1 - 2 * (qi**2 + qj**2)
     return R
 
 
@@ -536,3 +648,55 @@ def get_module(net):
         return net.module
     else:
         return net
+
+
+def get_obj_from_str(string, reload=False):
+    module, cls = string.rsplit(".", 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+
+def instantiate_from_config(config):
+    if not "target" in config:
+        if config == "__is_first_stage__":
+            return None
+        elif config == "__is_unconditional__":
+            return None
+        raise KeyError("Expected key `target` to instantiate.")
+    return get_obj_from_str(config["target"])(**config.get("params", dict()))
+
+
+class EglDeviceNotFoundError(Exception):
+    """Raised when EGL device cannot be found"""
+
+    def get_egl_device_id(cuda_id: int):
+        """
+        >>> i = get_egl_device_id(0)
+        >>> isinstance(i, int)
+        True
+        """
+        assert isinstance(cuda_id, int), "cuda_id has to be integer"
+        dir_path = Path(__file__).absolute().parents[2] / "egl_check"
+        if not os.path.isfile(dir_path / "EGL_options.o"):
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                print("Building EGL_options.o")
+                subprocess.call(["bash", "build.sh"], cwd=dir_path)
+            else:
+                # In case EGL_options.o has to be built and multiprocessing is used, give rank 0 process time to build
+                time.sleep(5)
+        result = subprocess.run(["./EGL_options.o"], capture_output=True, cwd=dir_path)
+        n = int(result.stderr.decode("utf-8").split(" of ")[1].split(".")[0])
+        for egl_id in range(n):
+            my_env = os.environ.copy()
+            my_env["EGL_VISIBLE_DEVICE"] = str(egl_id)
+            result = subprocess.run(
+                ["./EGL_options.o"], capture_output=True, cwd=dir_path, env=my_env
+            )
+            match = re.search(r"CUDA_DEVICE=[0-9]+", result.stdout.decode("utf-8"))
+            if match:
+                current_cuda_id = int(match[0].split("=")[1])
+                if cuda_id == current_cuda_id:
+                    return egl_id
+        raise EglDeviceNotFoundError

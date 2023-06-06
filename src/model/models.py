@@ -124,8 +124,10 @@ class PixelNeRFNet(torch.nn.Module):
             # Vector f: fx = fy = f_i *for view i*
             # Length should match NS (or 1 for broadcast)
             focal = focal.unsqueeze(-1).repeat((1, 2))
-        else:
+        elif len(focal.shape) == 2:
             focal = focal.clone()
+        elif len(focal.shape) == 3:
+            focal = focal[0].clone()
         self.focal = focal.float()
         self.focal[..., 1] *= -1.0
 
@@ -138,6 +140,9 @@ class PixelNeRFNet(torch.nn.Module):
         elif len(c.shape) == 1:
             # Vector c: cx = cy = c_i *for view i*
             c = c.unsqueeze(-1).repeat((1, 2))
+        elif len(c.shape) == 3:
+            c = c[0].clone()
+            
         self.c = c
 
         if self.use_global_encoder:
@@ -204,12 +209,28 @@ class PixelNeRFNet(torch.nn.Module):
             if self.use_encoder:
                 # Grab encoder's latent code.
                 uv = -xyz[:, :, :2] / xyz[:, :, 2:]  # (SB, B, 2)
-                uv *= repeat_interleave(
-                    self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1
-                )
-                uv += repeat_interleave(
-                    self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1
-                )  # (SB*NS, B, 2)
+
+                if self.focal.shape[0] == 1:
+                    uv *= repeat_interleave(
+                        self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1
+                    )
+                elif self.focal.shape[0] > 1:
+                    uv = uv.view(SB, self.focal.shape[0], -1, 2)
+                    # self.focal (NV, 2)
+                    tmp_focal = self.focal.view(1, self.focal.shape[0], 1, 2)
+                    uv *= tmp_focal
+                if self.c.shape[0] == 1:
+                    uv += repeat_interleave(
+                        self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1
+                    )  # (SB*NS, B, 2)
+                elif self.c.shape[0] > 1:
+                    uv = uv.view(SB, self.focal.shape[0], -1, 2)
+                    # self.c (NV, 2)
+                    tmp_c = self.c.view(1, self.c.shape[0], 1, 2)
+                    uv += tmp_c
+                
+                uv = uv.view(SB, B, 2)
+
                 latent = self.encoder.index(
                     uv, None, self.image_shape
                 )  # (SB * NS, latent, B)
