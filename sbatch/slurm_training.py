@@ -34,6 +34,7 @@ assert np.all(["hydra.run.dir" not in arg for arg in unknownargs])
 assert np.all(["log_dir" not in arg for arg in unknownargs])
 assert np.all(["hydra.sweep.dir" not in arg for arg in unknownargs])
 
+print(args.log_dir)
 log_dir = Path(args.log_dir).absolute() / f'{datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")}_{args.job_name}'
 os.makedirs(log_dir)
 args.script = Path(args.script).absolute()
@@ -155,4 +156,4 @@ def create_resume_script(slurm_cmd):
 
 
 submit_job(job_opts)
-create_eval_script()
+# create_eval_script()

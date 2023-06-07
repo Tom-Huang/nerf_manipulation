@@ -1,7 +1,7 @@
 torch
 torchvision
 pretrainedmodels
-pyhocon
+pyhocon==0.3.55
 imageio
 opencv-python
 imageio-ffmpeg
@@ -14,3 +14,4 @@ ipdb
 matplotlib
 tqdm
 lpips
+GitPython
