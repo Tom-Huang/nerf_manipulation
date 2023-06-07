@@ -13,9 +13,11 @@ from setuptools import sandbox
 default_log_dir = f"/home/{os.environ['USER']}/logs" if "USER" in os.environ else "/tmp"
 if default_log_dir == "/tmp":
     print("CAUTION: logging to /tmp")
-parser = argparse.ArgumentParser(description="Parse slurm parameters and hydra config overrides")
+parser = argparse.ArgumentParser(
+    description="Parse slurm parameters and hydra config overrides"
+)
 
-parser.add_argument("--script", type=str, default="./sbatch_nerf.sh")
+parser.add_argument("--script", type=str, default="./sbatch_nerf.bash")
 parser.add_argument("--train_file", type=str, default="../train/train.py")
 parser.add_argument("-l", "--log_dir", type=str, default=default_log_dir)
 parser.add_argument("-j", "--job_name", type=str, default="nerf_manipulation")
@@ -35,7 +37,10 @@ assert np.all(["log_dir" not in arg for arg in unknownargs])
 assert np.all(["hydra.sweep.dir" not in arg for arg in unknownargs])
 
 print(args.log_dir)
-log_dir = Path(args.log_dir).absolute() / f'{datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")}_{args.job_name}'
+log_dir = (
+    Path(args.log_dir).absolute()
+    / f'{datetime.datetime.now().strftime("%Y-%m-%d/%H-%M-%S")}_{args.job_name}'
+)
 os.makedirs(log_dir)
 args.script = Path(args.script).absolute()
 args.train_file = Path(args.train_file).absolute()
@@ -81,7 +86,9 @@ job_opts = {
 }
 
 if args.exclude is not None:
-    job_opts["exclude"] = ",".join(map(lambda x: f"dlcgpu{int(x):02d}", args.exclude.split(",")))
+    job_opts["exclude"] = ",".join(
+        map(lambda x: f"dlcgpu{int(x):02d}", args.exclude.split(","))
+    )
 
 
 def submit_job(job_info):
